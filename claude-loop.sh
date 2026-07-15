@@ -20,6 +20,7 @@
 #   MAX_ITERS   teto de iteracoes               (default: 50)
 #   DONE_CHECK  comando shell; o loop PARA quando ele retorna 0 (default: roda 1x e sai)
 #   PROMPT_FILE arquivo com o prompt (alternativa ao argumento)
+#   LOGDIR      pasta p/ log de cada iteracao (default: ./claude-loop-logs, 1 arquivo por iter)
 #
 # SEGURANCA: usa --dangerously-skip-permissions (autonomo, sem confirmar). Rode
 # so em repo/branch que voce controla. NUNCA ponha segredo no prompt/arquivo.
@@ -31,7 +32,8 @@ EFFORT="${EFFORT:-high}"
 MAX_ITERS="${MAX_ITERS:-50}"
 PROMPT="${1:-}"; [ -z "$PROMPT" ] && [ -n "${PROMPT_FILE:-}" ] && PROMPT="$(cat "$PROMPT_FILE")"
 [ -z "$PROMPT" ] && { echo "erro: forneca um prompt (argumento) ou PROMPT_FILE=<arquivo>" >&2; exit 2; }
-LOG="$(mktemp)"; BACKOFF=300; MAX_BACKOFF=3600   # backoff de fallback: 5min -> 1h
+LOGDIR="${LOGDIR:-./claude-loop-logs}"; mkdir -p "$LOGDIR"
+BACKOFF=300; MAX_BACKOFF=3600   # backoff de fallback: 5min -> 1h
 
 run()          { "$CLAUDE" -p --model "$MODEL" --effort "$EFFORT" --dangerously-skip-permissions "$1" 2>&1 | tee "$LOG"; return "${PIPESTATUS[0]}"; }
 rate_limited() { grep -qiE "hit your limit|limit reached|reached .*limit|usage limit|rate limit|resets?[[:space:]]+[0-9]|too many requests|overloaded|429" "$LOG"; }
@@ -54,7 +56,8 @@ iter=0
 while : ; do
   if done_check; then echo ">> DONE_CHECK satisfeito; concluido."; break; fi
   iter=$((iter+1)); [ "$iter" -gt "$MAX_ITERS" ] && { echo ">> teto MAX_ITERS=$MAX_ITERS atingido."; break; }
-  echo ">> ===== iteracao $iter ====="
+  LOG="$LOGDIR/iter-$(printf '%03d' "$iter").log"
+  echo ">> ===== iteracao $iter (log: $LOG) ====="
   if run "$PROMPT"; then
     BACKOFF=300                                  # sucesso: reseta o backoff
     [ -z "${DONE_CHECK:-}" ] && { echo ">> sem DONE_CHECK: rodou 1x, encerrando."; break; }
