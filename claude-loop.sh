@@ -21,6 +21,11 @@
 #   DONE_CHECK  comando shell; o loop PARA quando ele retorna 0 (default: roda 1x e sai)
 #   PROMPT_FILE arquivo com o prompt (alternativa ao argumento)
 #   LOGDIR      pasta p/ log de cada iteracao (default: ./claude-loop-logs, 1 arquivo por iter)
+#   STUCK_LOG   arquivo de log do proprio comando (ex.: .specify/agentic-loop.log). Se as
+#               ultimas STUCK_LIMIT linhas forem todas bloqueio (nao rate-limit, nao erro —
+#               ex. "working tree dirty", "refusing to work unattended"), para o loop: retry
+#               nao resolve um bloqueio que só um humano destrava.
+#   STUCK_LIMIT quantas linhas de bloqueio seguidas ate desistir (default: 2)
 #
 # SEGURANCA: usa --dangerously-skip-permissions (autonomo, sem confirmar). Rode
 # so em repo/branch que voce controla. NUNCA ponha segredo no prompt/arquivo.
@@ -51,6 +56,16 @@ wait_reset()   {
   fi
 }
 done_check()   { [ -z "${DONE_CHECK:-}" ] && return 1; eval "$DONE_CHECK"; }
+STUCK_LIMIT="${STUCK_LIMIT:-2}"
+stuck()        {
+  [ -z "${STUCK_LOG:-}" ] && return 1
+  [ -f "$STUCK_LOG" ] || return 1
+  local tail_lines total blocked
+  tail_lines="$(tail -n "$STUCK_LIMIT" "$STUCK_LOG")"
+  total=$(printf '%s\n' "$tail_lines" | grep -c .)
+  blocked=$(printf '%s\n' "$tail_lines" | grep -ciE 'dirty before start|refusing to work unattended|working tree dirty')
+  [ "$total" -ge "$STUCK_LIMIT" ] && [ "$blocked" -eq "$total" ]
+}
 
 iter=0
 while : ; do
@@ -60,6 +75,7 @@ while : ; do
   echo ">> ===== iteracao $iter (log: $LOG) ====="
   if run "$PROMPT"; then
     BACKOFF=300                                  # sucesso: reseta o backoff
+    if stuck; then echo ">> travado: ultimas $STUCK_LIMIT linhas de $STUCK_LOG sao bloqueio (nao rate-limit). So um humano resolve — parando."; break; fi
     [ -z "${DONE_CHECK:-}" ] && { echo ">> sem DONE_CHECK: rodou 1x, encerrando."; break; }
   elif rate_limited; then
     wait_reset                                   # dorme e retenta a MESMA iteracao
