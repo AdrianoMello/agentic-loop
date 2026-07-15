@@ -39,6 +39,11 @@
 #               na hora — nao espera chegar no AVAILABLE_BY pra reagir a um uso ja alto.
 #   USAGE_THRESHOLD % de uso da sessao atual que dispara parada antecipada (default: 90)
 #
+# Nota sobre AVAILABLE_BY: a janela de 5h so zera no horario que ela mesma tem marcado
+# (reset_info do widget), consumo nao adianta nem atrasa isso. Por isso o loop tambem
+# para assim que ficar claro que a janela ATIVA vai resetar depois de AVAILABLE_BY —
+# nao adianta so reagir ao % de uso, senao voce chega e a janela ainda nao zerou.
+#
 # SEGURANCA: usa --dangerously-skip-permissions (autonomo, sem confirmar). Rode
 # so em repo/branch que voce controla. NUNCA ponha segredo no prompt/arquivo.
 set -uo pipefail
@@ -98,12 +103,39 @@ usage_too_high() {
   ' "$USAGE_FILE" 2>/dev/null)
   [ -n "$pct" ] && [ "$pct" -ge "$USAGE_THRESHOLD" ]
 }
+usage_reset_epoch() {
+  # segundos ate a janela ATIVA resetar (reset_info: "1h53min" | "45min" | "resetou" | "")
+  [ -f "$USAGE_FILE" ] || return 1
+  local secs
+  secs=$(node -e '
+    try {
+      var ri = require(process.argv[1]).sessao_atual.reset_info || "";
+      if (/resetou/i.test(ri)) { console.log(0); }
+      else {
+        var h = /(\d+)\s*h/i.exec(ri), m = /(\d+)\s*min/i.exec(ri);
+        if (h || m) console.log((h ? parseInt(h[1],10)*3600 : 0) + (m ? parseInt(m[1],10)*60 : 0));
+      }
+    } catch (e) {}
+  ' "$USAGE_FILE" 2>/dev/null)
+  [ -z "$secs" ] && return 1
+  echo $(( $(date +%s) + secs ))
+}
+usage_wont_clear_in_time() {
+  [ -z "${AVAILABLE_BY:-}" ] && return 1
+  local target now cutoff reset_epoch
+  target=$(date -d "$AVAILABLE_BY" +%s 2>/dev/null) || return 1
+  now=$(date +%s); [ "$target" -le "$now" ] && target=$((target+86400))
+  cutoff=$((target - SAFETY_MARGIN_MIN*60))
+  reset_epoch=$(usage_reset_epoch) || return 1
+  [ "$reset_epoch" -ge "$cutoff" ]
+}
 
 iter=0
 while : ; do
   if done_check; then echo ">> DONE_CHECK satisfeito; concluido."; break; fi
   if past_cutoff; then echo ">> parando: dentro de ${SAFETY_MARGIN_MIN}min de $AVAILABLE_BY — reservando o limite pra voce."; break; fi
   if usage_too_high; then echo ">> parando: uso da sessao atual >= ${USAGE_THRESHOLD}% ($USAGE_FILE) — nao arrisco estourar antes de $AVAILABLE_BY."; break; fi
+  if usage_wont_clear_in_time; then echo ">> parando: a janela ativa so reseta as $(date -d "@$(usage_reset_epoch)" +%H:%M) — nao vai zerar a tempo de $AVAILABLE_BY. Continuar so pioraria."; break; fi
   iter=$((iter+1)); [ "$iter" -gt "$MAX_ITERS" ] && { echo ">> teto MAX_ITERS=$MAX_ITERS atingido."; break; }
   LOG="$LOGDIR/iter-$(printf '%03d' "$iter").log"
   RAWLOG="$LOGDIR/iter-$(printf '%03d' "$iter").raw.jsonl"
