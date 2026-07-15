@@ -30,19 +30,27 @@
 #               ex. "working tree dirty", "refusing to work unattended"), para o loop: retry
 #               nao resolve um bloqueio que só um humano destrava.
 #   STUCK_LIMIT quantas linhas de bloqueio seguidas ate desistir (default: 2)
-#   AVAILABLE_BY hora (ex.: "10:00") ate quando voce precisa do limite disponivel. O loop
-#               para de iniciar iteracoes novas SAFETY_MARGIN_MIN antes desse horario —
-#               reserva de proposito, nao tenta prever consumo por iteracao.
+#   AVAILABLE_BY hora OPCIONAL (ex.: "10:00") ate quando voce precisa do limite disponivel.
+#               Se omitida, o loop nao aplica nenhuma reserva por horario (roda ate DONE_CHECK
+#               / MAX_ITERS / rate-limit). Com ela, o loop para de iniciar iteracoes novas
+#               SAFETY_MARGIN_MIN antes do horario E prevê, pelo widget de uso, se pelo menos
+#               AVAILABLE_MIN% do limite estara disponivel nesse horario (ver AVAILABLE_MIN).
+#               Se o horario ja passou hoje, vale pro dia seguinte.
 #   SAFETY_MARGIN_MIN margem antes de AVAILABLE_BY p/ parar (default: 30)
-#   USAGE_FILE  json do widget de uso local (default: ~/Desktop/claude-usage/usage_data.json,
-#               se existir). Se o uso atual (sessao_atual.percentual) >= USAGE_THRESHOLD, para
-#               na hora — nao espera chegar no AVAILABLE_BY pra reagir a um uso ja alto.
-#   USAGE_THRESHOLD % de uso da sessao atual que dispara parada antecipada (default: 90)
+#   AVAILABLE_MIN % minimo do limite que precisa estar DISPONIVEL em AVAILABLE_BY (default: 70).
+#               O loop para quando prevê que sobraria menos que isso no horario.
+#   USAGE_FILE  json do widget de uso local (default: ~/Desktop/claude-usage/usage_data.json).
+#   CLAUDE_SESSION_KEY / CLAUDE_ORG_ID  se setados, o loop consulta o MESMO endpoint que o
+#               widget usa (GET $CLAUDE_API_BASE/api/organizations/<org>/usage, so cookie de
+#               sessao — NAO gasta tokens) e nao depende do widget estar rodando. Sem eles,
+#               cai no USAGE_FILE. SESSION_KEY = cookie 'sessionKey' do claude.ai; ORG_ID =
+#               cookie 'lastActiveOrg'. CLAUDE_API_BASE default: https://claude.ai
 #
-# Nota sobre AVAILABLE_BY: a janela de 5h so zera no horario que ela mesma tem marcado
-# (reset_info do widget), consumo nao adianta nem atrasa isso. Por isso o loop tambem
-# para assim que ficar claro que a janela ATIVA vai resetar depois de AVAILABLE_BY —
-# nao adianta so reagir ao % de uso, senao voce chega e a janela ainda nao zerou.
+# Como prevê a disponibilidade em AVAILABLE_BY (usa o widget): a janela de 5h so zera no
+# horario que ela mesma tem marcado (reset_info), consumo nao adianta nem atrasa isso.
+#   - Se a janela ATIVA reseta ANTES de AVAILABLE_BY, o uso atual sera zerado a tempo -> ok.
+#   - Se ainda estara ativa em AVAILABLE_BY, o uso atual persiste -> disponivel = 100 - uso;
+#     para quando isso cai abaixo de AVAILABLE_MIN. Reavalia a cada iteracao (auto-corrige).
 #
 # SEGURANCA: usa --dangerously-skip-permissions (autonomo, sem confirmar). Rode
 # so em repo/branch que voce controla. NUNCA ponha segredo no prompt/arquivo.
@@ -86,7 +94,7 @@ stuck()        {
 }
 SAFETY_MARGIN_MIN="${SAFETY_MARGIN_MIN:-30}"
 USAGE_FILE="${USAGE_FILE:-$HOME/Desktop/claude-usage/usage_data.json}"
-USAGE_THRESHOLD="${USAGE_THRESHOLD:-90}"
+AVAILABLE_MIN="${AVAILABLE_MIN:-70}"
 past_cutoff() {
   [ -z "${AVAILABLE_BY:-}" ] && return 1
   local target now cutoff
@@ -95,47 +103,75 @@ past_cutoff() {
   cutoff=$((target - SAFETY_MARGIN_MIN*60))
   [ "$now" -ge "$cutoff" ]
 }
-usage_too_high() {
+CLAUDE_API_BASE="${CLAUDE_API_BASE:-https://claude.ai}"
+usage_snapshot() {
+  # echo "PCT RESET_EPOCH": uso% da janela de 5h e epoch do proximo reset (0 = desconhecido).
+  # Falha (1) se nenhuma fonte responder.
+  # Fonte A — API claude.ai (mesmo endpoint do widget; NAO consome tokens): usada quando
+  #   CLAUDE_SESSION_KEY + CLAUDE_ORG_ID estao setados. Independe do widget estar rodando.
+  # Fonte B — widget local (USAGE_FILE): fallback quando nao ha credenciais da API.
+  local now pct resets_at reset_epoch json out secs
+  now=$(date +%s)
+  if [ -n "${CLAUDE_SESSION_KEY:-}" ] && [ -n "${CLAUDE_ORG_ID:-}" ]; then
+    json=$(curl -fsS --max-time 15 \
+      -H "anthropic-client-platform: web_claude_ai" \
+      -H "Cookie: sessionKey=$CLAUDE_SESSION_KEY" \
+      "$CLAUDE_API_BASE/api/organizations/$CLAUDE_ORG_ID/usage" 2>/dev/null) || json=""
+    if [ -n "$json" ]; then
+      out=$(printf '%s' "$json" | node -e '
+        let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{
+          var f=JSON.parse(s).five_hour||{};
+          if(typeof f.utilization==="number") console.log(Math.floor(f.utilization)+" "+(f.resets_at||""));
+        }catch(e){}});' 2>/dev/null)
+      if [ -n "$out" ]; then
+        read -r pct resets_at <<<"$out"
+        reset_epoch=0; [ -n "${resets_at:-}" ] && reset_epoch=$(date -d "$resets_at" +%s 2>/dev/null || echo 0)
+        echo "$pct $reset_epoch"; return 0
+      fi
+    fi
+  fi
   [ -f "$USAGE_FILE" ] || return 1
-  local pct
-  pct=$(node -e '
-    try { var p = require(process.argv[1]).sessao_atual.percentual; if (typeof p === "number") console.log(Math.floor(p)); } catch (e) {}
-  ' "$USAGE_FILE" 2>/dev/null)
-  [ -n "$pct" ] && [ "$pct" -ge "$USAGE_THRESHOLD" ]
-}
-usage_reset_epoch() {
-  # segundos ate a janela ATIVA resetar (reset_info: "1h53min" | "45min" | "resetou" | "")
-  [ -f "$USAGE_FILE" ] || return 1
-  local secs
-  secs=$(node -e '
+  read -r pct secs < <(node -e '
     try {
-      var ri = require(process.argv[1]).sessao_atual.reset_info || "";
-      if (/resetou/i.test(ri)) { console.log(0); }
-      else {
-        var h = /(\d+)\s*h/i.exec(ri), m = /(\d+)\s*min/i.exec(ri);
-        if (h || m) console.log((h ? parseInt(h[1],10)*3600 : 0) + (m ? parseInt(m[1],10)*60 : 0));
-      }
-    } catch (e) {}
+      var s = require(process.argv[1]).sessao_atual || {};
+      var pct = (typeof s.percentual === "number") ? Math.floor(s.percentual) : "";
+      var ri = s.reset_info || "", secs = "";
+      if (/resetou/i.test(ri)) secs = 0;
+      else { var h=/(\d+)\s*h/i.exec(ri), m=/(\d+)\s*min/i.exec(ri); if (h||m) secs=(h?parseInt(h[1],10)*3600:0)+(m?parseInt(m[1],10)*60:0); }
+      console.log(pct + " " + secs);
+    } catch (e) { console.log(" "); }
   ' "$USAGE_FILE" 2>/dev/null)
-  [ -z "$secs" ] && return 1
-  echo $(( $(date +%s) + secs ))
+  [ -n "${pct:-}" ] || return 1
+  reset_epoch=0; [ -n "${secs:-}" ] && reset_epoch=$((now + secs))
+  echo "$pct $reset_epoch"
 }
-usage_wont_clear_in_time() {
+avail_at_deadline() {
+  # % do limite previsto DISPONIVEL em AVAILABLE_BY; falha se nao der pra prever.
   [ -z "${AVAILABLE_BY:-}" ] && return 1
-  local target now cutoff reset_epoch
+  local target now snap pct reset_epoch
   target=$(date -d "$AVAILABLE_BY" +%s 2>/dev/null) || return 1
   now=$(date +%s); [ "$target" -le "$now" ] && target=$((target+86400))
-  cutoff=$((target - SAFETY_MARGIN_MIN*60))
-  reset_epoch=$(usage_reset_epoch) || return 1
-  [ "$reset_epoch" -ge "$cutoff" ]
+  snap=$(usage_snapshot) || return 1
+  pct=${snap%% *}; reset_epoch=${snap##* }
+  # janela ATIVA reseta antes do deadline -> uso atual sera zerado a tempo -> 100% disponivel
+  [ "$reset_epoch" -gt "$now" ] && [ "$reset_epoch" -le "$target" ] && { echo 100; return 0; }
+  # janela ainda ativa no deadline -> uso atual persiste
+  echo $(( 100 - pct ))
 }
+not_enough_at_deadline() {
+  local avail
+  avail=$(avail_at_deadline) || return 1
+  [ "$avail" -lt "$AVAILABLE_MIN" ]
+}
+
+# CLAUDE_LOOP_LIB=1: so define as funcoes (pro self-test), nao roda o loop.
+[ -n "${CLAUDE_LOOP_LIB:-}" ] && return 0 2>/dev/null
 
 iter=0
 while : ; do
   if done_check; then echo ">> DONE_CHECK satisfeito; concluido."; break; fi
   if past_cutoff; then echo ">> parando: dentro de ${SAFETY_MARGIN_MIN}min de $AVAILABLE_BY — reservando o limite pra voce."; break; fi
-  if usage_too_high; then echo ">> parando: uso da sessao atual >= ${USAGE_THRESHOLD}% ($USAGE_FILE) — nao arrisco estourar antes de $AVAILABLE_BY."; break; fi
-  if usage_wont_clear_in_time; then echo ">> parando: a janela ativa so reseta as $(date -d "@$(usage_reset_epoch)" +%H:%M) — nao vai zerar a tempo de $AVAILABLE_BY. Continuar so pioraria."; break; fi
+  if not_enough_at_deadline; then echo ">> parando: previsao de $(avail_at_deadline)% disponivel em $AVAILABLE_BY (< ${AVAILABLE_MIN}% exigido) — reservando o limite pra voce."; break; fi
   iter=$((iter+1)); [ "$iter" -gt "$MAX_ITERS" ] && { echo ">> teto MAX_ITERS=$MAX_ITERS atingido."; break; }
   LOG="$LOGDIR/iter-$(printf '%03d' "$iter").log"
   RAWLOG="$LOGDIR/iter-$(printf '%03d' "$iter").raw.jsonl"
