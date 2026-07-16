@@ -24,6 +24,15 @@ mkusage 10 "23h"; AVAILABLE_BY="$near" not_enough_at_deadline && { echo "FAIL: 9
 # 4) sem AVAILABLE_BY -> nenhuma parada por uso
 mkusage 99 "23h"; not_enough_at_deadline && { echo "FAIL: sem deadline nao deveria parar"; exit 1; }
 
+# 4b) reset_time_from_log: ignora "resets HH:MM" do conteudo da tarefa, pega o aviso REAL.
+#     Reproduz o bug: falso positivo antes, aviso verdadeiro depois no mesmo log.
+log="$TMP/raw.jsonl"
+{
+  echo '{"text":"... doc: 5-hour limit reached - resets 3:00 PM ..."}'
+  echo '{"type":"result","content":[{"type":"text","text":"You'\''ve hit your session limit · resets 1:20am"}]}'
+} > "$log"
+got=$(reset_time_from_log "$log"); [ "$got" = "1:20am" ] || { echo "FAIL: deveria pegar 1:20am (aviso real), pegou '$got'"; exit 1; }
+
 # 5) fonte API (curl mockado): usa five_hour.utilization/resets_at em vez do widget
 export CLAUDE_SESSION_KEY=x CLAUDE_ORG_ID=y
 resets="$(date -d '+23 hours' +%Y-%m-%dT%H:%M:%S)"   # janela ainda ativa no deadline

@@ -68,10 +68,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 run()          { "$CLAUDE" -p --model "$MODEL" --effort "$EFFORT" --dangerously-skip-permissions --output-format stream-json --verbose "$1" 2>&1 | tee "$RAWLOG" | node "$SCRIPT_DIR/render-log.js" | tee "$LOG"; return "${PIPESTATUS[0]}"; }
 rate_limited() { grep -qiE "hit your limit|limit reached|reached .*limit|usage limit|rate limit|resets?[[:space:]]+[0-9]|too many requests|overloaded|429" "$RAWLOG"; }
+reset_time_from_log() {
+  # extrai a hora do AVISO real de limite ("...hit your ... limit · resets 1:20am") de $1.
+  # NAO usa qualquer "resets HH:MM" do log: o conteudo da tarefa pode citar horarios (ex. um
+  # doc com "5-hour limit reached - resets 3:00 PM"). Ancora no aviso e pega a ULTIMA
+  # ocorrencia (o aviso real vem no fim do stream); so cai no padrao solto se nada casar.
+  local rt
+  rt=$(grep -oiE "hit your[^\"]*limit[^\"]*resets?[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*[ap]m" "$1" | grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[ap]m' | tail -1)
+  [ -z "$rt" ] && rt=$(grep -oiE 'resets?[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*[ap]m' "$1" | grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[ap]m' | tail -1)
+  [ -n "$rt" ] && echo "$rt"
+}
 wait_reset()   {
-  # dorme ate a hora que o CLI informa ("resets 12:30am"); se nao parsear, backoff cego
+  # dorme ate a hora do aviso de limite; se nao parsear, backoff cego
   local rt target now
-  rt=$(grep -oiE 'resets?[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*[ap]m' "$RAWLOG" | grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[ap]m' | head -1)
+  rt=$(reset_time_from_log "$RAWLOG")
   if [ -n "$rt" ] && target=$(date -d "$rt" +%s 2>/dev/null) && [ -n "$target" ]; then
     now=$(date +%s); [ "$target" -le "$now" ] && target=$((target+86400))
     echo ">> limite atingido; dormindo ate $rt (~$(( (target-now)/60 ))min)" >&2
