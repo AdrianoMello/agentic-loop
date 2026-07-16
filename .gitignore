@@ -1,1 +1,8 @@
 claude-loop-logs/
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secret*
+.session*
