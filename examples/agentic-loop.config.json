@@ -1,0 +1,18 @@
+{
+  "usage_guard": false,
+  "usage_data_path": "%USERPROFILE%\\Desktop\\claude-usage\\usage_data.json",
+  "usage_threshold_percent": 95,
+  "notify_noops": false,
+  "max_review_retries": 1,
+  "max_cycles": 15,
+  "max_consecutive_failures": 3,
+  "stop_on_critical_question": true,
+  "continue_on_commit": true,
+  "wake_seconds_after_commit": 5,
+  "subagent_required": false,
+  "available_by": null,
+  "available_min": 70,
+  "safety_margin_min": 30,
+  "stuck_log": ".specify/agentic-loop.log",
+  "stuck_limit": 2
+}

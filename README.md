@@ -1,110 +1,79 @@
-# claude-loop
+# agentic-loop
 
-Roda uma tarefa no **Claude Code** de forma autônoma e **sobrevive ao estouro do
-limite de uso**: quando os tokens acabam, ele lê a hora do reset (`resets 12:30am`),
-dorme até lá e retoma de onde parou. Serve para deixar tarefas longas rodando AFK
-(overnight, fim de semana) — build de feature, validação em lote, refactor iterativo.
+Duas camadas, um objetivo: implementar Spec Kit **sem babá**, com blast radius
+limitado e estado em disco (não na sessão).
 
-A ideia central: **o estado do trabalho vive em disco** (arquivos + git), não na
-sessão. Se o limite matar a invocação, a próxima retomada lê o disco e continua.
-Por isso combina muito bem com fluxos em que o progresso fica gravado, como o
-[Spec Kit](https://github.com/github/spec-kit) (`tasks.md` com checkboxes).
+## Motor vs protocolo
 
-## Setup do zero (cada máquina precisa disto)
-
-O motor em si não precisa de nada exótico. O que **cada pessoa** configura no
-próprio PC/conta:
-
-1. **bash** — Windows: instale o **Git Bash** (https://git-scm.com/download/win).
-   macOS/Linux já vêm com bash.
-2. **Node.js** (para instalar o CLI) — https://nodejs.org (LTS).
-3. **Claude Code CLI**:
-   ```bash
-   npm install -g @anthropic-ai/claude-code
-   claude --version        # confirma a instalação
-   ```
-4. **Login (individual!)** — rode `claude` uma vez e faça login com a **sua própria
-   conta/assinatura** Claude. Este é o passo que não se copia entre máquinas: cada
-   um usa e paga a própria conta. Sem login, o loop não roda.
-
-Confira o caminho do CLI se `claude` não estiver no PATH do bash:
-```bash
-which claude            # Windows: where claude   (ex.: /c/nvm4w/nodejs/claude)
-```
-
-`date -d` (parse da hora do reset) já vem no Git Bash e no Linux. No macOS, se o
-parse falhar, o loop usa backoff cego automaticamente — ou instale `coreutils`.
-
-> O motor genérico **não** usa `uv`, `ffmpeg`, `python` nem Graphify — isso só é
-> necessário em fluxos específicos (visão/vídeo, grafo de código), não aqui.
-
-## Instalação
-
-Copie `claude-loop.sh` para onde quiser e dê permissão de execução:
-
-```bash
-chmod +x claude-loop.sh
-```
-
-Descubra o caminho do seu `claude` se ele não estiver no PATH:
-
-```bash
-which claude            # ou, no Windows: where claude
-```
-
-## Uso
-
-```bash
-# 1) Rodar um prompt uma vez (resiliente a limite):
-./claude-loop.sh "revise o módulo de auth e conserte os testes que falham"
-
-# 2) Rodar até uma condição de parada sua (DONE_CHECK):
-#    aqui: repete até não sobrar checkbox aberto em tasks.md
-DONE_CHECK='! grep -qE "^\s*-\s*\[ \]" tasks.md' \
-  ./claude-loop.sh "/implemente a próxima tarefa não marcada em tasks.md; pare ao concluir uma"
-
-# 3) Escolher modelo e esforço de raciocínio:
-MODEL=claude-opus-4-8 EFFORT=max ./claude-loop.sh "refatore o serviço X"
-```
-
-### Knobs (variáveis de ambiente)
-
-| Var | Default | O que faz |
+| Camada | O quê | Onde |
 |---|---|---|
-| `CLAUDE` | `claude` | caminho do CLI (ex.: `/c/nvm4w/nodejs/claude`) |
-| `MODEL` | `claude-fable-5` | modelo (`claude-opus-4-8`, `claude-sonnet-5`, …) |
-| `EFFORT` | `high` | raciocínio: `low` \| `medium` \| `high` \| `max` |
-| `MAX_ITERS` | `50` | teto de iterações (anti-loop-infinito) |
-| `DONE_CHECK` | — | comando shell; o loop **para quando ele retorna 0**. Sem isso, roda 1×. |
-| `PROMPT_FILE` | — | lê o prompt de um arquivo em vez do argumento |
+| **Protocolo (worker)** | 1 task: implement → blind review → commit local | `commands/agentic-loop.md` + `commands/agentic-loop-intake.md` |
+| **Motor (driver)** | Loop AFK que sobrevive a rate-limit / reserva horário | `claude-loop.sh` + `render-log.js` |
 
-## Como funciona a resiliência
+```text
+intake (opcional) → tasks.md
+        ↓
+  protocolo: /agentic-loop   ← 1 task por invocação
+        ↓
+  driver: /loop  |  claude-loop.sh (Claude Code AFK)
+```
 
-1. Roda `claude -p --model … --effort … --dangerously-skip-permissions "<prompt>"`.
-2. Se a saída contém a mensagem de limite (`hit your limit`, `resets HH:MM`, `429`, `overloaded`…), extrai a hora do reset e **dorme até lá** (+2 min). Se não conseguir ler a hora, cai num backoff de 5 min → 1 h.
-3. Retoma a **mesma** iteração. O `DONE_CHECK` decide quando encerrar.
+- **Cursor:** use skills + `/loop`. **Não** rode `claude-loop.sh` no Cursor
+  (`--dangerously-skip-permissions` é path Claude Code).
+- **Claude Code overnight:** `examples/done-check-speckit.sh` (liga
+  `STUCK_LOG=.specify/agentic-loop.log` + `DONE_CHECK` nos checkboxes).
 
-## Padrão avançado: loop fechado "medir → corrigir → remedir"
+Prompt canônico (stack completa): [`prompts/grind-canonical.md`](prompts/grind-canonical.md).
 
-Para ir além de "faz e para" — iterar até uma **métrica** bater uma meta —, o mesmo
-motor serve: seu prompt escreve um `metrics.json`, e um wrapper por fora lê a métrica
-e decide continuar. Um exemplo real desse padrão (validar falso-positivos de um
-detector e auto-corrigir até a precisão-alvo) vive no projeto que originou este kit;
-replique a ideia trocando o prompt e o `DONE_CHECK` por algo como
-`DONE_CHECK='python -c "import json,sys; sys.exit(0 if json.load(open(\"metrics.json\"))[\"precision\"]>=0.85 else 1)"'`.
+## Setup do zero (Claude Code)
 
-## Segurança (leia antes de rodar)
+1. **bash** — Windows: [Git Bash](https://git-scm.com/download/win).
+2. **Node.js** LTS + `npm install -g @anthropic-ai/claude-code` + login (`claude`).
+3. Copie `commands/*.md` → `~/.claude/commands/`.
+4. `chmod +x claude-loop.sh examples/done-check-speckit.sh`.
 
-- **`--dangerously-skip-permissions`**: o agente edita arquivos e roda comandos **sem
-  pedir confirmação**. Use só em repo/branch que você controla, de preferência numa
-  branch dedicada ou num `git worktree` isolado.
-- **Nunca** coloque segredos (tokens, chaves, `.env`) no prompt ou no `PROMPT_FILE` —
-  eles iriam parar em logs. Passe segredos por variável de ambiente e leia-os no
-  código, não no prompt.
-- O loop consome tokens da **sua conta** enquanto roda. Ele é finito (para no
-  `DONE_CHECK` ou `MAX_ITERS`), mas rode quando não precisar da conta em paralelo.
-- Comece com `MODEL`/`EFFORT` menores para validar o fluxo antes de soltar no caro.
+## Uso rápido
+
+```bash
+# 1) Um prompt resiliente a limite:
+./claude-loop.sh "revise o módulo X e conserte os testes"
+
+# 2) Spec Kit até zerar tasks (recomendado):
+./examples/done-check-speckit.sh
+# ou manualmente:
+STUCK_LOG=.specify/agentic-loop.log \
+DONE_CHECK='! grep -qE "^\s*-\s*\[ \]" tasks.md' \
+  ./claude-loop.sh "$(sed -n '/^```text$/,/^```$/p' prompts/grind-canonical.md | sed '1d;$d')"
+```
+
+### Knobs do motor (`claude-loop.sh`)
+
+| Var | Default | Função |
+|---|---|---|
+| `CLAUDE` / `MODEL` / `EFFORT` | `claude` / `claude-fable-5` / `high` | CLI |
+| `MAX_ITERS` | `50` | teto anti-loop |
+| `DONE_CHECK` | — | para quando exit 0; sem isso roda 1× |
+| `STUCK_LOG` / `STUCK_LIMIT` | — / `2` | para se o worker repetir bloqueio humano |
+| `AVAILABLE_BY` / `AVAILABLE_MIN` / `SAFETY_MARGIN_MIN` | — / `70` / `30` | reserva limite para horário humano |
+| `USAGE_FILE` | `~/Desktop/claude-usage/usage_data.json` | widget local |
+| `CLAUDE_SESSION_KEY` + `CLAUDE_ORG_ID` | — | API usage (sem gastar tokens) |
+
+Espelho JSON (Cursor / projeto): `examples/agentic-loop.config.json`.
+
+## Segurança
+
+- **`--dangerously-skip-permissions`:** edita e roda comandos sem confirmar.
+  Use só em branch/`git worktree` **isolado** que você controla.
+- **Nunca** coloque secrets no prompt, `PROMPT_FILE`, ou git.
+- **`CLAUDE_SESSION_KEY` / `CLAUDE_ORG_ID`:** cookies da sessão claude.ai.
+  Exporte só no shell local / secret store. **Não** versionar. Não colar em
+  issues/PRs/logs. Rotacione se vazar. Sem esses vars o motor cai no `USAGE_FILE`.
+- O loop gasta tokens da **sua** conta até `DONE_CHECK` / `MAX_ITERS` / reserva.
+
+## Cursor
+
+Ver [`cursor/README.md`](cursor/README.md).
 
 ## Licença
 
-Faça o que quiser. Sem garantias.
+MIT — veja [LICENSE](LICENSE). Contribuições: [CONTRIBUTING.md](CONTRIBUTING.md).
